@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: ingest (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ingest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: ingest/go.mod
+          cache-dependency-path: ingest/go.sum
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  rust:
+    name: processor (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: processor
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: processor
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  python:
+    name: reports (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: reports/requirements-dev.txt
+      - run: pip install -r reports/requirements-dev.txt
+      - run: |
+          ruff check reports deploy
+          ruff format --check reports deploy
+      - working-directory: reports
+        run: pytest -v
+
+  layer-cache:
+    name: Кеш слоёв Docker (повыш. №5)
+    needs: dockerfiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Холодная сборка, повторная и после правки кода
+        shell: bash # явный bash включает pipefail: ошибка скрипта не потеряется за tee
+        run: bash ci/cache-check.sh | tee -a "$GITHUB_STEP_SUMMARY"
+
+  dockerfiles:
+    name: Линтер Dockerfile (hadolint)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [ingest, processor, reports]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: ${{ matrix.service }}/Dockerfile
+          config: .hadolint.yaml
