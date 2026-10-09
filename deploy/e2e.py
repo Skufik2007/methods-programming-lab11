@@ -93,8 +93,20 @@ def main() -> None:
         check(not bad, f"статистика совпадает с эталоном Python {bad or ''}")
         check(sum(report["histogram"]["counts"]) == len(values), "гистограмма покрывает все значения")
 
+    # Экстремальные значения: представимая статистика считается, непредставимая — failed,
+    # и ни то ни другое не ломает список отчётов.
+    status, body = call("POST", f"{args.ingest}/api/v1/batches", {"name": "extreme", "values": [1e300, -1e300]})
+    check(status == 202 and wait_done(args.ingest, body["id"]) == "done", "огромные значения ±1e300 обработаны")
+    status, body = call("POST", f"{args.ingest}/api/v1/batches", {"name": "extreme", "values": [1e308, 1e308]})
+    check(status == 202 and wait_done(args.ingest, body["id"]) == "failed", "сумма вне f64 — пакет в failed")
+    status, _ = call("GET", f"{args.reports}/api/v1/reports")
+    check(status == 200, f"список отчётов работает после экстремальных пакетов ({status})")
+
     status, summary = call("GET", f"{args.reports}/api/v1/summary")
-    check(status == 200 and summary["reports"] >= len(sent), f"сводка: {summary}")
+    check(
+        status == 200 and summary["reports"] >= len(sent) and summary["failed"] >= 1 and summary["invalid_files"] == 0,
+        f"сводка: {summary}",
+    )
     print("\nвсе проверки пройдены")
 
 
