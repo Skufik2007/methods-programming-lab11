@@ -13,7 +13,7 @@ COPY *.go ./
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /ingest . \
-    && mkdir -p /rootfs/data && chown 10001:10001 /rootfs/data
+    && mkdir -p /rootfs/data
 
 # ---- финальный образ: scratch, только бинарь ----
 FROM scratch

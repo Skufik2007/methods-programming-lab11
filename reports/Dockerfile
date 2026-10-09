@@ -8,7 +8,7 @@ RUN python -m venv /venv
 # (повторная установка после смены одной версии не качает всё заново).
 COPY requirements.txt /tmp/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip /venv/bin/pip install -r /tmp/requirements.txt \
-    && mkdir -p /rootfs/data && chown 10001:10001 /rootfs/data
+    && mkdir -p /rootfs/data
 
 # ---- финальный образ: venv + код, без pip-кеша и файлов сборки ----
 FROM python:3.12-slim

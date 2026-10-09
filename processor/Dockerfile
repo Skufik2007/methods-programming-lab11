@@ -24,10 +24,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build --release --locked \
     && cp target/release/processor /processor
 
-# В scratch нет mkdir/chown — готовим каталог volume здесь. Docker при первом
+# В scratch нет mkdir — каталог для volume готовим здесь. Docker при первом
 # подключении именованного volume копирует в него содержимое и владельца /data
 # из образа, поэтому непривилегированный пользователь сможет туда писать.
-RUN mkdir -p /rootfs/data && chown 10001:10001 /rootfs/data
+RUN mkdir -p /rootfs/data
 
 # ---- финальный образ: пустой, только статический бинарь ----
 FROM scratch
