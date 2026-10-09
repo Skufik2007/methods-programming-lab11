@@ -84,20 +84,28 @@ const (
 
 var ErrUnknownBatch = errors.New("пакет не найден")
 
-// Status ищет пакет по каталогам. Порядок важен: файл переходит
-// inbox -> processing -> outbox|failed, поэтому проверка идёт с конца,
-// чтобы не пропустить пакет, переехавший между двумя проверками.
+// afterStat вызывается после каждой проверки каталога; в тестах через него
+// имитируется перемещение файла processor-ом между двумя проверками.
+var afterStat = func(dir string) {}
+
+// Status ищет пакет по каталогам. Файл движется только вперёд:
+// inbox -> processing -> outbox | failed. Поэтому каталоги проверяются в том же
+// порядке: если пакета не оказалось в inbox, он уже дальше по цепочке, и
+// следующие проверки его найдут, даже если он переедет между двумя stat.
+// При обратном порядке (outbox -> ... -> inbox) пакет, перенесённый из inbox в
+// processing уже после проверки processing, не нашёлся бы нигде — ответ 404.
 func (s *Spool) Status(id string) (Status, error) {
 	for _, c := range []struct {
 		dir    string
 		status Status
 	}{
+		{DirInbox, StatusQueued},
+		{DirProcessing, StatusProcessing},
 		{DirOutbox, StatusDone},
 		{DirFailed, StatusFailed},
-		{DirProcessing, StatusProcessing},
-		{DirInbox, StatusQueued},
 	} {
 		_, err := os.Stat(filepath.Join(s.root, c.dir, id+".json"))
+		afterStat(c.dir)
 		if err == nil {
 			return c.status, nil
 		}

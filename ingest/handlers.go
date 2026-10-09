@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -50,12 +52,8 @@ func (a *API) createBatch(w http.ResponseWriter, r *http.Request) {
 	dec.DisallowUnknownFields()
 	var req batchRequest
 	if err := dec.Decode(&req); err != nil {
-		var sizeErr *http.MaxBytesError
-		if errors.As(err, &sizeErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("тело больше %d байт", sizeErr.Limit))
-			return
-		}
-		writeError(w, http.StatusBadRequest, "некорректный JSON: "+err.Error())
+		status, msg := describeDecodeError(err)
+		writeError(w, status, msg)
 		return
 	}
 	if !namePattern.MatchString(req.Name) {
@@ -78,6 +76,34 @@ func (a *API) createBatch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"id": b.ID, "status": StatusQueued, "values": len(b.Values), "status_url": statusURL,
 	})
+}
+
+// describeDecodeError переводит ошибку разбора JSON в код ответа и сообщение на русском,
+// чтобы клиент не получал внутренние английские тексты encoding/json.
+func describeDecodeError(err error) (int, string) {
+	var (
+		sizeErr   *http.MaxBytesError
+		syntaxErr *json.SyntaxError
+		typeErr   *json.UnmarshalTypeError
+	)
+	switch {
+	case errors.As(err, &sizeErr):
+		return http.StatusRequestEntityTooLarge, fmt.Sprintf("тело больше %d байт", sizeErr.Limit)
+	case errors.Is(err, io.EOF):
+		return http.StatusBadRequest, "пустое тело запроса"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return http.StatusBadRequest, "JSON обрывается раньше времени"
+	case errors.As(err, &syntaxErr):
+		return http.StatusBadRequest, fmt.Sprintf("синтаксическая ошибка JSON на позиции %d", syntaxErr.Offset)
+	case errors.As(err, &typeErr):
+		return http.StatusBadRequest, fmt.Sprintf("поле %s: ожидается %s", typeErr.Field, typeErr.Type)
+	// У ошибки DisallowUnknownFields нет отдельного типа — узнаём по тексту (закреплено тестом).
+	case strings.HasPrefix(err.Error(), "json: unknown field "):
+		return http.StatusBadRequest, "неизвестное поле " + strings.TrimPrefix(err.Error(), "json: unknown field ")
+	default:
+		// Например, число вне диапазона float64 (1e400).
+		return http.StatusBadRequest, "некорректный JSON"
+	}
 }
 
 func (a *API) batchStatus(w http.ResponseWriter, r *http.Request) {

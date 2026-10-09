@@ -87,6 +87,33 @@ func TestCreateBatchValidation(t *testing.T) {
 	}
 }
 
+// Ошибки разбора JSON возвращаются на русском, без внутренних текстов encoding/json.
+func TestDecodeErrorMessages(t *testing.T) {
+	api, _ := newAPI(t)
+	h := api.Routes()
+	cases := map[string]string{
+		``:                                     "пустое тело запроса",
+		`{"name":"ok","values":[1`:             "JSON обрывается раньше времени",
+		`{"name":"ok",}`:                       "синтаксическая ошибка JSON",
+		`{"name":"ok","values":["x"]}`:         "ожидается float64",
+		`{"name":"ok","values":[1],"extra":1}`: `неизвестное поле "extra"`,
+		`{"name":"ok","values":[1e400]}`:       "ожидается float64",
+	}
+	for body, want := range cases {
+		w := do(h, "POST", "/api/v1/batches", body)
+		var resp struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(w.Body.Bytes(), &resp) // сообщение без JSON-экранирования кавычек
+		if w.Code != http.StatusBadRequest || !strings.Contains(resp.Error, want) {
+			t.Errorf("%q: %d %q, ожидалось %q", body, w.Code, resp.Error, want)
+		}
+		if strings.Contains(resp.Error, "json:") {
+			t.Errorf("%q: в ответ попал внутренний текст encoding/json: %q", body, resp.Error)
+		}
+	}
+}
+
 func TestBatchStatus(t *testing.T) {
 	api, dir := newAPI(t)
 	h := api.Routes()
@@ -98,6 +125,8 @@ func TestBatchStatus(t *testing.T) {
 	if w := do(h, "GET", "/api/v1/batches/not-uuid", ""); w.Code != 400 {
 		t.Fatalf("не UUID: %d", w.Code)
 	}
+	// Файл проходит этапы так же, как его двигает processor: переименованием.
+	prev := ""
 	for _, step := range []struct {
 		dir  string
 		want Status
@@ -106,12 +135,49 @@ func TestBatchStatus(t *testing.T) {
 		{DirProcessing, StatusProcessing},
 		{DirOutbox, StatusDone},
 	} {
-		if err := os.WriteFile(filepath.Join(dir, step.dir, id+".json"), []byte("{}"), 0o644); err != nil {
+		target := filepath.Join(dir, step.dir, id+".json")
+		var err error
+		if prev == "" {
+			err = os.WriteFile(target, []byte("{}"), 0o644)
+		} else {
+			err = os.Rename(prev, target)
+		}
+		if err != nil {
 			t.Fatal(err)
 		}
+		prev = target
 		w := do(h, "GET", "/api/v1/batches/"+id, "")
-		if !strings.Contains(w.Body.String(), string(step.want)) {
+		if !strings.Contains(w.Body.String(), `"status":"`+string(step.want)+`"`) {
 			t.Fatalf("в %s: %s", step.dir, w.Body)
+		}
+	}
+}
+
+// Пакет, который processor переносит на следующий этап в любой момент проверки,
+// всё равно находится: Status не должен отвечать «не найден» на существующий пакет.
+func TestStatusRaceWithProcessor(t *testing.T) {
+	next := map[string]string{DirInbox: DirProcessing, DirProcessing: DirOutbox}
+	t.Cleanup(func() { afterStat = func(string) {} })
+
+	for _, start := range []string{DirInbox, DirProcessing} {
+		for _, trigger := range []string{DirInbox, DirProcessing, DirOutbox, DirFailed} {
+			_, root := newAPI(t)
+			spool, _ := NewSpool(root)
+			id := "0b5f1d3e-7c2a-4f6e-9a1b-2c3d4e5f6a7b"
+			path := func(dir string) string { return filepath.Join(root, dir, id+".json") }
+			if err := os.WriteFile(path(start), []byte("{}"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			moved := false
+			afterStat = func(dir string) {
+				if dir == trigger && !moved {
+					moved = true
+					_ = os.Rename(path(start), path(next[start]))
+				}
+			}
+			if _, err := spool.Status(id); err != nil {
+				t.Errorf("пакет из %s, перенос после проверки %s: %v", start, trigger, err)
+			}
 		}
 	}
 }
