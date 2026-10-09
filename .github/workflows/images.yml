@@ -1,0 +1,127 @@
+# Повышенное задание 3: CI/CD, который собирает и пушит образы всех трёх языков.
+#
+# - pull request: образы собираются (проверка Dockerfile), но не публикуются;
+# - push в main: публикуются в GHCR с тегами sha-<commit> и latest;
+# - тег v1.2.3: дополнительно теги 1.2.3 и 1.2.
+# После публикации job e2e скачивает именно эти образы по тегу sha-<commit>,
+# поднимает compose и прогоняет сквозной тест — проверяется то, что опубликовано.
+name: Images
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io/skufik2007 # GHCR требует имя владельца в нижнем регистре
+
+jobs:
+  build:
+    name: Образ ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # пуш в GHCR токеном GITHUB_TOKEN, без личных секретов
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [ingest, processor, reports]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Вход в GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Теги и метки образа
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/lab11-${{ matrix.service }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=pr
+
+      - name: Сборка и публикация
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.service }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Кеш слоёв между запусками CI — отдельная область на каждый сервис,
+          # mode=max сохраняет и промежуточные этапы (слой зависимостей).
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  e2e:
+    name: Сквозной тест опубликованных образов
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Скачать образы этого коммита и поднять compose
+        run: |
+          export TAG="sha-${GITHUB_SHA::7}"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          docker compose pull
+          docker compose up --no-build --detach --wait --wait-timeout 120
+
+      - name: Сквозной тест Go → volume → Rust → volume → Python
+        run: python3 deploy/e2e.py
+
+      - name: Содержимое общего volume
+        run: |
+          docker run --rm -v lab11_shared-data:/data:ro alpine:3.22 \
+            sh -c 'for d in inbox processing outbox failed; do echo "$d: $(ls /data/$d | wc -l) файлов"; done; ls -ln /data'
+
+      - name: Размеры образов
+        run: |
+          {
+            echo "### Размеры опубликованных образов (тег $TAG)"
+            echo "| Образ | Размер |"
+            echo "|---|---:|"
+            docker image ls --format '| {{.Repository}}:{{.Tag}} | {{.Size}} |' | grep lab11- | sort
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Остановка по SIGTERM без SIGKILL
+        run: |
+          start=$(date +%s)
+          docker compose stop
+          took=$(( $(date +%s) - start ))
+          echo "остановка заняла ${took} с"
+          docker compose logs processor | tail -n 3
+          docker compose logs processor | grep -q 'processor остановлен'
+          test "$took" -lt 10
+
+      - name: Логи при ошибке
+        if: failure()
+        run: docker compose logs
+
+      - name: Очистка
+        if: always()
+        run: docker compose down --volumes
