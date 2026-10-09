@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from .store import ReportStore, valid_id
+from .models import FailedBatch, Report
+from .store import InvalidFileError, ReportStore, valid_id
 
 
 class ReportBrief(BaseModel):
@@ -34,6 +35,7 @@ class Summary(BaseModel):
     failed: int
     values: int
     by_name: dict[str, int]
+    invalid_files: int = Field(description="Повреждённые файлы в outbox/ и failed/, пропущенные при чтении")
 
 
 def create_app(data_dir: Path | None = None) -> FastAPI:
@@ -60,46 +62,52 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         offset: Annotated[int, Query(ge=0)] = 0,
         name: Annotated[str | None, Query(max_length=64)] = None,
     ) -> ReportList:
-        items = store.reports(name)
+        items, _ = store.reports(name)
         page = items[offset : offset + limit]
         return ReportList(
             total=len(items),
             items=[
-                ReportBrief(
-                    id=r["id"],
-                    name=r["name"],
-                    processed_at=r["processed_at"],
-                    count=r["stats"]["count"],
-                    mean=r["stats"]["mean"],
-                )
+                ReportBrief(id=r.id, name=r.name, processed_at=r.processed_at, count=r.stats.count, mean=r.stats.mean)
                 for r in page
             ],
         )
 
-    @app.get("/api/v1/reports/{report_id}", tags=["reports"])
-    def get_report(report_id: str) -> dict[str, Any]:
+    @app.get(
+        "/api/v1/reports/{report_id}",
+        response_model=Report,
+        tags=["reports"],
+        responses={502: {"description": "Файл отчёта повреждён"}},
+    )
+    def get_report(report_id: str) -> Report:
         if not valid_id(report_id):
             raise HTTPException(400, "id должен быть UUID")
-        report = store.report(report_id)
+        try:
+            report = store.report(report_id)
+        except InvalidFileError as exc:
+            # Данные испортил источник (processor или ручная правка volume), а не клиент.
+            raise HTTPException(502, "файл отчёта повреждён и не соответствует формату") from exc
         if report is None:
             raise HTTPException(404, "отчёт не найден (пакет ещё обрабатывается или не существует)")
         return report
 
-    @app.get("/api/v1/failed", tags=["reports"])
-    def failed() -> list[dict[str, Any]]:
-        return store.failed()
+    @app.get("/api/v1/failed", response_model=list[FailedBatch], tags=["reports"])
+    def failed() -> list[FailedBatch]:
+        items, _ = store.failed()
+        return items
 
     @app.get("/api/v1/summary", response_model=Summary, tags=["reports"])
     def summary() -> Summary:
-        reports = store.reports()
+        reports, bad_reports = store.reports()
+        failed_items, bad_failed = store.failed()
         by_name: dict[str, int] = {}
         for r in reports:
-            by_name[r["name"]] = by_name.get(r["name"], 0) + 1
+            by_name[r.name] = by_name.get(r.name, 0) + 1
         return Summary(
             reports=len(reports),
-            failed=len(store.failed()),
-            values=sum(r["stats"]["count"] for r in reports),
+            failed=len(failed_items),
+            values=sum(r.stats.count for r in reports),
             by_name=by_name,
+            invalid_files=bad_reports + bad_failed,
         )
 
     return app

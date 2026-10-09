@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import statistics
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -14,6 +15,7 @@ from app.store import ReportStore
 
 
 def make_report(name: str, values: list[float], processed_at: str) -> dict[str, Any]:
+    """Отчёт в том формате, в каком его пишет processor (processor/src/main.rs)."""
     return {
         "id": str(uuid.uuid4()),
         "name": name,
@@ -21,7 +23,17 @@ def make_report(name: str, values: list[float], processed_at: str) -> dict[str, 
         "processed_at": processed_at,
         "duration_ms": 0.1,
         "processor": "rust-processor/0.1.0",
-        "stats": {"count": len(values), "mean": sum(values) / len(values)},
+        "stats": {
+            "count": len(values),
+            "sum": sum(values),
+            "mean": statistics.fmean(values),
+            "min": min(values),
+            "max": max(values),
+            "median": statistics.median(values),
+            "p95": max(values),
+            "p99": max(values),
+            "stddev": statistics.stdev(values) if len(values) > 1 else 0.0,
+        },
         "histogram": {"min": min(values), "max": max(values), "counts": [len(values)]},
     }
 
@@ -75,13 +87,39 @@ def test_summary_and_failed(client: TestClient, data_dir: Path) -> None:
     put(data_dir, "failed", {"id": str(uuid.uuid4()), "error": "пустой пакет", "failed_at": "2026-10-09T10:00:04Z"})
 
     s = client.get("/api/v1/summary").json()
-    assert s == {"reports": 3, "failed": 1, "values": 6, "by_name": {"a": 2, "b": 1}}
+    assert s == {"reports": 3, "failed": 1, "values": 6, "by_name": {"a": 2, "b": 1}, "invalid_files": 0}
     assert client.get("/api/v1/failed").json()[0]["error"] == "пустой пакет"
 
 
-def test_corrupted_file_is_skipped(client: TestClient, data_dir: Path) -> None:
+def _broken_reports() -> dict[str, Any]:
+    with_null = make_report("x", [1], "2026-10-09T10:00:01Z")
+    with_null["stats"]["mean"] = None  # так serde_json записывает NaN/inf
+    no_stats = make_report("x", [1], "2026-10-09T10:00:01Z")
+    del no_stats["stats"]
+    wrong_type = make_report("x", [1], "2026-10-09T10:00:01Z")
+    wrong_type["stats"]["count"] = "много"
+    return {"null вместо числа": with_null, "нет stats": no_stats, "неверный тип": wrong_type}
+
+
+@pytest.mark.parametrize("case", list(_broken_reports()))
+def test_broken_report_does_not_break_listing(client: TestClient, data_dir: Path, case: str) -> None:
+    broken = _broken_reports()[case]
+    put(data_dir, "outbox", broken)
+    put(data_dir, "outbox", make_report("ok", [1, 2], "2026-10-09T10:00:02Z"))
     (data_dir / "outbox" / f"{uuid.uuid4()}.json").write_text("{not json", encoding="utf-8")
-    put(data_dir, "outbox", make_report("ok", [1], "2026-10-09T10:00:01Z"))
+
+    r = client.get("/api/v1/reports")
+    assert r.status_code == 200, r.text  # раньше один такой файл давал 500 на всём списке
+    assert r.json()["total"] == 1
+    assert client.get("/api/v1/summary").json()["invalid_files"] == 2
+    assert client.get(f"/api/v1/reports/{broken['id']}").status_code == 502
+
+
+def test_extra_fields_are_ignored(client: TestClient, data_dir: Path) -> None:
+    # «Терпимый читатель»: новое поле в отчёте processor не ломает reports.
+    report = make_report("x", [1, 2], "2026-10-09T10:00:01Z")
+    report["new_field"] = {"anything": 1}
+    put(data_dir, "outbox", report)
     assert client.get("/api/v1/reports").json()["total"] == 1
 
 
@@ -96,12 +134,21 @@ def test_cache_rereads_changed_file(data_dir: Path) -> None:
     store = ReportStore(data_dir)
     report = make_report("x", [1], "2026-10-09T10:00:01Z")
     put(data_dir, "outbox", report)
-    assert store.report(report["id"])["name"] == "x"
+    assert store.report(report["id"]).name == "x"
 
     report["name"] = "renamed-longer-name"  # другой размер файла -> кеш недействителен
     put(data_dir, "outbox", report)
-    assert store.report(report["id"])["name"] == "renamed-longer-name"
+    assert store.report(report["id"]).name == "renamed-longer-name"
 
     (data_dir / "outbox" / f"{report['id']}.json").unlink()
-    assert store.reports() == []
+    assert store.reports() == ([], 0)
     assert store._cache == {}  # удалённый файл ушёл из кеша
+
+
+def test_broken_file_logged_once(data_dir: Path, caplog: pytest.LogCaptureFixture) -> None:
+    (data_dir / "outbox" / f"{uuid.uuid4()}.json").write_text("{not json", encoding="utf-8")
+    store = ReportStore(data_dir)
+    for _ in range(3):
+        store.reports()
+    # Повреждённый файл кешируется как повреждённый и не засоряет лог на каждом запросе.
+    assert sum("пропущен некорректный файл" in m for m in caplog.messages) == 1
