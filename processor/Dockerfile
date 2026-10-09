@@ -1,7 +1,11 @@
 # syntax=docker/dockerfile:1
 
+# Базовые образы закреплены по digest: тег со временем указывает на другой образ,
+# а digest — всегда на один и тот же, поэтому сборка и кеш слоёв воспроизводимы.
+# Обновить: docker buildx imagetools inspect <образ:тег> и заменить sha256.
+
 # ---- сборка: Alpine = musl, Rust по умолчанию линкует musl-бинарь статически ----
-FROM rust:1.99-alpine AS build
+FROM rust:1.99-alpine@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627 AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 
