@@ -1,0 +1,64 @@
+# Конвейер из трёх сервисов на трёх языках с обменом данными через общий volume:
+#
+#   клиент → ingest (Go) → /data/inbox → processor (Rust) → /data/outbox → reports (Python) → клиент
+#
+#   docker compose up --build --wait     # собрать локально
+#   TAG=sha-1a2b3c4 docker compose pull && docker compose up --wait   # готовые образы из GHCR
+#   python deploy/e2e.py
+#   docker compose down -v
+
+name: lab11
+
+# Общие настройки всех сервисов.
+x-service: &service
+  restart: unless-stopped
+  networks: [pipeline]
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+
+services:
+  ingest:
+    <<: *service
+    build: ./ingest
+    image: ${REGISTRY:-ghcr.io/skufik2007}/lab11-ingest:${TAG:-latest}
+    environment:
+      DATA_DIR: /data
+      MAX_VALUES: "100000"
+    volumes:
+      - shared-data:/data          # пишет в inbox/
+    ports:
+      - "8081:8080"
+
+  processor:
+    <<: *service
+    build: ./processor
+    image: ${REGISTRY:-ghcr.io/skufik2007}/lab11-processor:${TAG:-latest}
+    environment:
+      DATA_DIR: /data
+      POLL_INTERVAL_MS: "200"
+    volumes:
+      - shared-data:/data          # inbox/ → processing/ → outbox/ | failed/
+    # Наружу не публикуется: /health и /metrics доступны только внутри сети.
+    expose: ["9090"]
+
+  reports:
+    <<: *service
+    build: ./reports
+    image: ${REGISTRY:-ghcr.io/skufik2007}/lab11-reports:${TAG:-latest}
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - shared-data:/data:ro       # только чтение outbox/ и failed/
+    ports:
+      - "8082:8000"
+    depends_on:
+      processor:
+        condition: service_healthy
+
+volumes:
+  shared-data:
+
+networks:
+  pipeline:
+    name: lab11-pipeline
