@@ -7,6 +7,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -46,14 +47,27 @@ impl Spool {
         self.root.join(name)
     }
 
-    /// Возвращает в inbox пакеты, которые остались в processing после аварийной остановки.
-    pub fn recover(&self) -> io::Result<usize> {
+    /// Возвращает в inbox пакеты, которые лежат в processing дольше `stale_after`:
+    /// их владелец упал или не смог записать отчёт.
+    ///
+    /// Свежие пакеты не трогаются — их прямо сейчас обрабатывает другой экземпляр
+    /// processor. Время отсчитывается от захвата: claim_next обновляет mtime файла.
+    pub fn recover_stale(&self, stale_after: Duration) -> io::Result<usize> {
+        let now = SystemTime::now();
         let mut n = 0;
         for entry in fs::read_dir(self.dir(PROCESSING))? {
             let entry = entry?;
-            if is_batch_file(&entry.path()) {
-                fs::rename(entry.path(), self.dir(INBOX).join(entry.file_name()))?;
-                n += 1;
+            if !is_batch_file(&entry.path()) {
+                continue;
+            }
+            let claimed_at = entry.metadata()?.modified()?;
+            if now.duration_since(claimed_at).unwrap_or_default() < stale_after {
+                continue;
+            }
+            match fs::rename(entry.path(), self.dir(INBOX).join(entry.file_name())) {
+                Ok(()) => n += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {} // уже вернул другой экземпляр
+                Err(e) => return Err(e),
             }
         }
         Ok(n)
@@ -81,6 +95,12 @@ impl Spool {
             let target = self.dir(PROCESSING).join(&file_name);
             match fs::rename(&path, &target) {
                 Ok(()) => {
+                    // rename сохраняет mtime создания файла; отмечаем момент захвата,
+                    // чтобы recover_stale считал время обработки, а не время в очереди.
+                    fs::File::options()
+                        .write(true)
+                        .open(&target)?
+                        .set_modified(SystemTime::now())?;
                     let id = Path::new(&file_name)
                         .file_stem()
                         .unwrap_or_default()
@@ -98,13 +118,23 @@ impl Spool {
     /// Пишет отчёт в outbox и удаляет пакет из processing.
     pub fn complete<T: Serialize>(&self, claimed: &Claimed, report: &T) -> io::Result<()> {
         write_atomic(&self.dir(OUTBOX), &claimed.id, report)?;
-        fs::remove_file(&claimed.path)
+        remove_claimed(&claimed.path)
     }
 
     /// Пишет причину ошибки в failed/ и удаляет пакет из processing.
     pub fn fail<T: Serialize>(&self, claimed: &Claimed, info: &T) -> io::Result<()> {
         write_atomic(&self.dir(FAILED), &claimed.id, info)?;
-        fs::remove_file(&claimed.path)
+        remove_claimed(&claimed.path)
+    }
+}
+
+/// Пакета в processing может уже не быть: если обработка шла дольше тайм-аута,
+/// recover_stale другого экземпляра вернул его в очередь. Результат тот же
+/// (отчёт перезапишется идентичным), поэтому это не ошибка.
+fn remove_claimed(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
@@ -179,12 +209,60 @@ mod tests {
         }
     }
 
+    fn set_age(path: &Path, age: Duration) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
     #[test]
-    fn recover_returns_stuck_batches() {
+    fn recover_returns_only_stale_batches() {
         let tmp = tempfile::tempdir().unwrap();
         let spool = Spool::open(tmp.path()).unwrap();
         put(&spool, PROCESSING, "stuck.json", "{}");
-        assert_eq!(spool.recover().unwrap(), 1);
+        put(&spool, PROCESSING, "busy.json", "{}");
+        set_age(
+            &spool.dir(PROCESSING).join("stuck.json"),
+            Duration::from_secs(600),
+        );
+
+        assert_eq!(spool.recover_stale(Duration::from_secs(300)).unwrap(), 1);
         assert!(spool.dir(INBOX).join("stuck.json").exists());
+        // Пакет, захваченный только что (другим экземпляром), остаётся у него.
+        assert!(spool.dir(PROCESSING).join("busy.json").exists());
+    }
+
+    #[test]
+    fn claim_marks_claim_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = Spool::open(tmp.path()).unwrap();
+        put(&spool, INBOX, "old.json", "{}");
+        // Пакет долго ждал в очереди — это не значит, что его обработка зависла.
+        set_age(
+            &spool.dir(INBOX).join("old.json"),
+            Duration::from_secs(3600),
+        );
+
+        spool.claim_next().unwrap().unwrap();
+        assert_eq!(spool.recover_stale(Duration::from_secs(300)).unwrap(), 0);
+    }
+
+    #[test]
+    fn complete_tolerates_batch_reclaimed_by_other_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = Spool::open(tmp.path()).unwrap();
+        put(&spool, INBOX, "a.json", "{}");
+        let a = spool.claim_next().unwrap().unwrap();
+        // Обработка затянулась, другой экземпляр вернул пакет в очередь.
+        set_age(&a.path, Duration::from_secs(600));
+        spool.recover_stale(Duration::from_secs(300)).unwrap();
+
+        spool
+            .complete(&a, &serde_json::json!({"ok": true}))
+            .unwrap();
+        assert!(spool.dir(OUTBOX).join("a.json").exists());
     }
 }

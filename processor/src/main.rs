@@ -69,15 +69,22 @@ fn main() {
             std::process::exit(1);
         }
     };
-    match spool.recover() {
-        Ok(0) => {}
-        Ok(n) => log(
-            "warn",
-            "возвращены пакеты, зависшие в processing",
-            json!({"count": n}),
-        ),
-        Err(e) => log("error", "recover", json!({"error": e.to_string()})),
-    }
+    // Пакет, который пролежал в processing дольше этого времени, считается брошенным
+    // (владелец упал или не смог записать отчёт) и возвращается в очередь.
+    let stale_after = Duration::from_secs(
+        env("PROCESSING_TIMEOUT_SEC", "300")
+            .parse()
+            .unwrap_or_else(|_| {
+                log(
+                    "error",
+                    "PROCESSING_TIMEOUT_SEC: ожидается целое число секунд",
+                    json!({}),
+                );
+                std::process::exit(2);
+            }),
+    );
+    recover(&spool, stale_after);
+    let mut last_recover = Instant::now();
 
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -112,6 +119,10 @@ fn main() {
     );
     while !stop.load(Ordering::SeqCst) {
         metrics.heartbeat.store(now_unix(), Ordering::Relaxed);
+        if last_recover.elapsed() >= RECOVER_INTERVAL {
+            recover(&spool, stale_after);
+            last_recover = Instant::now();
+        }
         match spool.claim_next() {
             Ok(Some(claimed)) => handle(&spool, &claimed, &metrics),
             Ok(None) => sleep_interruptible(poll, &stop),
@@ -130,6 +141,21 @@ fn main() {
         "processor остановлен",
         json!({"processed": metrics.processed.load(Ordering::Relaxed)}),
     );
+}
+
+/// Как часто искать брошенные пакеты в processing.
+const RECOVER_INTERVAL: Duration = Duration::from_secs(60);
+
+fn recover(spool: &Spool, stale_after: Duration) {
+    match spool.recover_stale(stale_after) {
+        Ok(0) => {}
+        Ok(n) => log(
+            "warn",
+            "в очередь возвращены пакеты, зависшие в processing",
+            json!({"count": n, "stale_after_sec": stale_after.as_secs()}),
+        ),
+        Err(e) => log("error", "recover", json!({"error": e.to_string()})),
+    }
 }
 
 fn handle(spool: &Spool, claimed: &Claimed, metrics: &Metrics) {
