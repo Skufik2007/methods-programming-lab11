@@ -29,6 +29,8 @@ pub struct Histogram {
 pub enum StatsError {
     Empty,
     NotFinite(usize),
+    /// Значения конечны, но статистика по ним переполняет f64 (например, 1e308 и −1e308).
+    Overflow,
 }
 
 impl std::fmt::Display for StatsError {
@@ -38,6 +40,10 @@ impl std::fmt::Display for StatsError {
             StatsError::NotFinite(i) => {
                 write!(f, "значение values[{i}] не является конечным числом")
             }
+            StatsError::Overflow => write!(
+                f,
+                "значения слишком велики по модулю: статистика выходит за пределы f64"
+            ),
         }
     }
 }
@@ -55,15 +61,23 @@ pub fn compute(values: &[f64]) -> Result<(Stats, Histogram), StatsError> {
     sorted.sort_by(f64::total_cmp);
     let n = sorted.len();
 
+    // Масштаб — наибольшее значение по модулю. Промежуточные величины считаются для
+    // x / scale ∈ [−1, 1] и не переполняются, даже когда сами значения близки к 1e308:
+    // без этого для [1e300, −1e300] квадрат отклонения (≈ 4e600) давал бы inf,
+    // хотя ответ (σ ≈ 1.4e300) представим.
+    let scale = sorted[0].abs().max(sorted[n - 1].abs());
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+
     // Алгоритм Уэлфорда: устойчив к потере точности на больших суммах.
     let (mut mean, mut m2) = (0.0, 0.0);
     for (i, &x) in values.iter().enumerate() {
+        let x = x / scale;
         let delta = x - mean;
         mean += delta / (i + 1) as f64;
         m2 += delta * (x - mean);
     }
     let stddev = if n > 1 {
-        (m2 / (n - 1) as f64).sqrt()
+        (m2 / (n - 1) as f64).sqrt() * scale
     } else {
         0.0
     };
@@ -71,7 +85,7 @@ pub fn compute(values: &[f64]) -> Result<(Stats, Histogram), StatsError> {
     let stats = Stats {
         count: n,
         sum: values.iter().sum(),
-        mean,
+        mean: mean * scale,
         min: sorted[0],
         max: sorted[n - 1],
         median: percentile(&sorted, 0.5),
@@ -79,27 +93,43 @@ pub fn compute(values: &[f64]) -> Result<(Stats, Histogram), StatsError> {
         p99: percentile(&sorted, 0.99),
         stddev,
     };
-    Ok((stats, histogram(&sorted)))
+    // Если результат всё же не помещается в f64 (сумма 1e308 + 1e308), serde_json записал
+    // бы inf как null, и отчёт с «пустой» статистикой выглядел бы успешным — это ошибка.
+    let all_finite = [stats.sum, stats.mean, stats.stddev]
+        .iter()
+        .all(|v| v.is_finite());
+    if !all_finite {
+        return Err(StatsError::Overflow);
+    }
+    Ok((stats, histogram(&sorted, scale)))
 }
 
 /// Перцентиль с линейной интерполяцией (как numpy.percentile по умолчанию).
+/// Форма lo·(1−f) + hi·f не переполняется даже для lo = −1e308, hi = 1e308.
 fn percentile(sorted: &[f64], q: f64) -> f64 {
     let pos = q * (sorted.len() - 1) as f64;
     let lo = pos.floor() as usize;
     let hi = pos.ceil() as usize;
-    sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo as f64)
+    let frac = pos - lo as f64;
+    if frac == 0.0 {
+        sorted[lo]
+    } else {
+        sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    }
 }
 
 /// Гистограмма из HISTOGRAM_BINS равных интервалов от min до max (max входит в последний).
-fn histogram(sorted: &[f64]) -> Histogram {
+/// Интервалы считаются в масштабированных значениях: max − min может не поместиться в f64.
+fn histogram(sorted: &[f64], scale: f64) -> Histogram {
     let (min, max) = (sorted[0], sorted[sorted.len() - 1]);
     let mut counts = vec![0; HISTOGRAM_BINS];
     if min == max {
         counts[0] = sorted.len();
     } else {
-        let width = (max - min) / HISTOGRAM_BINS as f64;
+        let (smin, smax) = (min / scale, max / scale);
+        let width = (smax - smin) / HISTOGRAM_BINS as f64;
         for &v in sorted {
-            let bin = (((v - min) / width) as usize).min(HISTOGRAM_BINS - 1);
+            let bin = (((v / scale - smin) / width) as usize).min(HISTOGRAM_BINS - 1);
             counts[bin] += 1;
         }
     }
@@ -167,5 +197,26 @@ mod tests {
             compute(&[f64::INFINITY]).unwrap_err(),
             StatsError::NotFinite(0)
         );
+    }
+
+    #[test]
+    fn huge_values_do_not_overflow_intermediates() {
+        // Ответы представимы, хотя квадраты отклонений — нет.
+        let (s, h) = compute(&[1e300, -1e300]).unwrap();
+        assert_eq!(s.mean, 0.0);
+        assert!((s.stddev / 1e300 - std::f64::consts::SQRT_2).abs() < 1e-12);
+        assert_eq!(h.counts.iter().sum::<usize>(), 2);
+
+        // Разброс 2e308 не помещается в f64, но статистика — помещается.
+        let (s, h) = compute(&[-1e308, 1e308]).unwrap();
+        assert_eq!((s.sum, s.mean, s.median), (0.0, 0.0, 0.0));
+        assert!(s.stddev.is_finite());
+        assert_eq!((h.counts[0], h.counts[HISTOGRAM_BINS - 1]), (1, 1));
+    }
+
+    #[test]
+    fn unrepresentable_result_is_an_error_not_null() {
+        // Каждое значение конечно, но сумма 2e308 в f64 не помещается.
+        assert_eq!(compute(&[1e308, 1e308]).unwrap_err(), StatsError::Overflow);
     }
 }
