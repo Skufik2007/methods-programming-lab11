@@ -19,7 +19,9 @@ ENV PATH=/venv/bin:$PATH \
     PORT=8000
 # Порядок слоёв — от редко меняющихся к часто: venv, затем код.
 COPY --from=build /venv /venv
-COPY --from=build /rootfs/data /data
+# --chown обязателен: COPY --from не переносит владельца, без него /data
+# принадлежал бы root и сервис под 10001 не смог бы писать в volume.
+COPY --from=build --chown=10001:10001 /rootfs/data /data
 WORKDIR /srv
 COPY app ./app
 USER 10001:10001

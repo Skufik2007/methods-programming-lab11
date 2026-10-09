@@ -18,7 +18,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # ---- финальный образ: scratch, только бинарь ----
 FROM scratch
 COPY --from=build /ingest /ingest
-COPY --from=build /rootfs/data /data
+# --chown обязателен: COPY --from не переносит владельца, без него /data
+# принадлежал бы root и сервис под 10001 не смог бы писать в volume.
+COPY --from=build --chown=10001:10001 /rootfs/data /data
 USER 10001:10001
 ENV ADDR=:8080 \
     DATA_DIR=/data

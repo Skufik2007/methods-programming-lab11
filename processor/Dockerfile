@@ -32,7 +32,9 @@ RUN mkdir -p /rootfs/data && chown 10001:10001 /rootfs/data
 # ---- финальный образ: пустой, только статический бинарь ----
 FROM scratch
 COPY --from=build /processor /processor
-COPY --from=build /rootfs/data /data
+# --chown обязателен: COPY --from не переносит владельца, без него /data
+# принадлежал бы root и сервис под 10001 не смог бы писать в volume.
+COPY --from=build --chown=10001:10001 /rootfs/data /data
 USER 10001:10001
 ENV DATA_DIR=/data \
     HEALTH_ADDR=0.0.0.0:9090
