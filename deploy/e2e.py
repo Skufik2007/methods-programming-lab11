@@ -90,7 +90,7 @@ def main() -> None:
         want = expected(values)
         got = report["stats"]
         bad = {k: (got[k], v) for k, v in want.items() if not math.isclose(got[k], v, rel_tol=1e-9, abs_tol=1e-9)}
-        check(not bad, f"статистика совпадает с эталоном Python {'' if not bad else bad}")
+        check(not bad, f"статистика совпадает с эталоном Python {bad or ''}")
         check(sum(report["histogram"]["counts"]) == len(values), "гистограмма покрывает все значения")
 
     status, summary = call("GET", f"{args.reports}/api/v1/summary")
