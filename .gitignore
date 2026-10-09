@@ -1,0 +1,16 @@
+# Сборка
+/bin/
+target/
+*.exe
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.log
+
+# IDE
+.vscode/
+.idea/
