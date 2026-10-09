@@ -1,0 +1,13 @@
+[project]
+name = "lab11-reports"
+version = "1.0.0"
+description = "Python-сервис ЛР №11: отдаёт отчёты из общего volume"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+    # Starlette предлагает перейти на httpx2 для TestClient; на поведение тестов не влияет.
+    "ignore:Using .httpx. with .starlette.testclient. is deprecated",
+]

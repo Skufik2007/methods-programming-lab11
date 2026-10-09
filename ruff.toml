@@ -1,0 +1,16 @@
+# Общие правила для Python-кода репозитория (reports/ и deploy/).
+line-length = 120
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "DTZ", "PYI", "PLW", "S"]
+# RUF001-003: в строках и комментариях намеренно используется кириллица.
+# S101: assert в тестах — норма для pytest.
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[lint.per-file-ignores]
+"reports/tests/*" = ["S101"]
+"deploy/*" = ["S310"]  # urllib с адресом из аргументов — это и есть назначение скрипта
+
+[lint.isort]
+known-first-party = ["app"]
