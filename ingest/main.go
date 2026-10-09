@@ -38,6 +38,12 @@ func run(addr string, log *slog.Logger) error {
 	if err != nil || maxValues < 1 {
 		return errors.New("MAX_VALUES: ожидается положительное целое")
 	}
+	// Должен быть меньше stop_grace_period в compose, иначе Docker пришлёт SIGKILL
+	// раньше, чем дождёмся активных запросов.
+	shutdownTimeout, err := time.ParseDuration(env("SHUTDOWN_TIMEOUT", "15s"))
+	if err != nil || shutdownTimeout < 0 {
+		return errors.New("SHUTDOWN_TIMEOUT: ожидается длительность вида 15s")
+	}
 	spool, err := NewSpool(env("DATA_DIR", "/data"))
 	if err != nil {
 		return err
@@ -71,7 +77,7 @@ func run(addr string, log *slog.Logger) error {
 	case <-ctx.Done():
 	}
 	log.Info("получен сигнал, останавливаемся")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shutdown: %w", err)

@@ -13,6 +13,10 @@ name: lab11
 x-service: &service
   restart: unless-stopped
   networks: [pipeline]
+  # По умолчанию Docker ждёт 10 с и шлёт SIGKILL. Сервисы останавливаются сами:
+  # ingest ждёт запросы до SHUTDOWN_TIMEOUT (15 с), reports — до 10 с, processor
+  # доделывает текущий пакет. Запас до 20 с, чтобы SIGKILL не прервал их раньше.
+  stop_grace_period: 20s
   logging:
     driver: json-file
     options: {max-size: "10m", max-file: "3"}
@@ -25,6 +29,7 @@ services:
     environment:
       DATA_DIR: /data
       MAX_VALUES: "100000"
+      SHUTDOWN_TIMEOUT: 15s
     volumes:
       - shared-data:/data          # пишет в inbox/
     ports:
@@ -37,6 +42,7 @@ services:
     environment:
       DATA_DIR: /data
       POLL_INTERVAL_MS: "200"
+      PROCESSING_TIMEOUT_SEC: "300"
     volumes:
       - shared-data:/data          # inbox/ → processing/ → outbox/ | failed/
     # Наружу не публикуется: /health и /metrics доступны только внутри сети.
