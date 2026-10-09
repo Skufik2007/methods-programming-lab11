@@ -26,6 +26,15 @@ build() { # service tag [extra args] -> печатает лог сборки
 
 seconds() { awk "BEGIN {printf \"%.1f\", $1/1000000000}"; }
 
+# Число шагов RUN в логе BuildKit, у которых нет отметки CACHED.
+uncached_run_steps() {
+  local log=$1 n=0 id
+  for id in $(grep -oE '^#[0-9]+ \[[^]]+\] RUN' "$log" | grep -oE '^#[0-9]+' | sort -u); do
+    grep -qE "^${id} CACHED" "$log" || n=$((n + 1))
+  done
+  echo "$n"
+}
+
 echo "| Образ | Холодная сборка, с | Без изменений, с | После правки кода, с | Слой зависимостей из кеша | Размер |"
 echo "|---|---:|---:|---:|:---:|---:|"
 
@@ -41,21 +50,28 @@ for svc in ingest processor reports; do
   build "$svc" "$tag" > "/tmp/$svc-edit.log"; t3=$(date +%s%N)
   cp "/tmp/$svc.bak" "$src"
 
-  # Номер шага BuildKit с установкой зависимостей и проверка, что он CACHED.
+  # После правки кода шаг установки зависимостей обязан взяться из кеша.
   step=$(grep -F "${DEPS_STEP[$svc]}" "/tmp/$svc-edit.log" | grep -oE '^#[0-9]+' | head -n1 || true)
   if [[ -n "$step" ]] && grep -qE "^${step} CACHED" "/tmp/$svc-edit.log"; then
     cached="да"
   else
     cached="**НЕТ**"
   fi
-  # Без изменений не должен выполниться ни один шаг RUN.
-  if grep -qE '^#[0-9]+ \[.*\] RUN' "/tmp/$svc-warm.log" && ! grep -qE '^#[0-9]+ CACHED' "/tmp/$svc-warm.log"; then
-    cached="**НЕТ (повторная сборка не из кеша)**"
-  fi
+  # Без изменений из кеша обязан взяться КАЖДЫЙ шаг RUN, а не хотя бы один.
+  uncached=$(uncached_run_steps "/tmp/$svc-warm.log")
   size=$(docker image ls "$tag" --format '{{.Size}}')
 
   echo "| $svc | $(seconds $((t1 - t0))) | $(seconds $((t2 - t1))) | $(seconds $((t3 - t2))) | $cached | $size |"
-  [[ "$cached" == "да" ]] || { echo "::error::$svc: слой зависимостей пересобран после правки кода" >&2; cat "/tmp/$svc-edit.log" >&2; exit 1; }
+  if [[ "$cached" != "да" ]]; then
+    echo "::error::$svc: слой зависимостей пересобран после правки кода" >&2
+    cat "/tmp/$svc-edit.log" >&2
+    exit 1
+  fi
+  if [[ "$uncached" -ne 0 ]]; then
+    echo "::error::$svc: при повторной сборке без изменений $uncached шагов RUN выполнены заново" >&2
+    cat "/tmp/$svc-warm.log" >&2
+    exit 1
+  fi
 done
 
 echo
